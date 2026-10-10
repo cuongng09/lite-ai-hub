@@ -21,12 +21,21 @@ docker compose up -d
 
 ## 4. Cài đặt thư viện Python
 ```bash
-python -m venv venv
+py install 3.12
+# Remove the old folder if it exists
+Remove-Item -Recurse -Force venv -ErrorAction SilentlyContinue
+
+# Create the venv with 3.12
+py -3.12 -m venv venv
+
 # Windows:
-.\venv\Scripts\activate
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
+.\venv\Scripts\Activate.ps1
+
 # Linux/macOS:
 source venv/bin/activate
 
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
