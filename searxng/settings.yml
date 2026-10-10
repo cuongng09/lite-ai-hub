@@ -1,0 +1,11 @@
+use_default_settings: true
+server:
+  secret_key: "lite_ai_hub_secret_key_change_me"
+  limiter: false
+  image_proxy: false
+search:
+  safe_search: 0
+  autocomplete: ""
+  formats:
+    - html
+    - json
