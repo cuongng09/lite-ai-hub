@@ -1,0 +1,45 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/tooling/cli/schema.json",
+  "build": {
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "",
+    "devPath": "http://127.0.0.1:8000",
+    "distDir": "../static"
+  },
+  "package": {
+    "productName": "Lite-AI Hub",
+    "version": "3.0.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false,
+      "shell": {
+        "all": false,
+        "open": true
+      },
+      "http": {
+        "all": false,
+        "request": true,
+        "scope": ["http://127.0.0.1:8000/*", "http://localhost:8000/*"]
+      }
+    },
+    "bundle": {
+      "active": true,
+      "targets": ["nsis", "msi"],
+      "identifier": "com.liteaihub.app",
+      "icon": []
+    },
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:8000 http://localhost:8000; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:;"
+    },
+    "windows": [
+      {
+        "title": "Lite-AI Hub • Local AI Assistant",
+        "width": 1200,
+        "height": 820,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ]
+  }
+}

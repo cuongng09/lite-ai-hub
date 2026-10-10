@@ -1,13 +1,20 @@
+# Lite-AI Hub Core Dependencies (Siêu nhẹ, Zero-Docker, Zero-Streamlit)
 fastapi>=0.110.0
 uvicorn>=0.28.0
-streamlit>=1.32.0
-llama-index>=0.10.20
-llama-index-llms-ollama>=0.1.2
-llama-index-embeddings-ollama>=0.1.2
-llama-index-vector-stores-chroma>=0.1.4
-chromadb>=0.4.24
+pydantic>=2.0.0
+httpx>=0.27.0
+ddgs>=6.0.0
+duckduckgo-search>=6.0.0
 pypdf>=4.0.0
-requests>=2.31.0
-pydantic>=2.6.4
-python-dotenv>=1.0.1
+python-docx>=1.1.0
+numpy>=1.24.0
 python-multipart>=0.0.9
+
+# Testing
+pytest>=8.0.0
+
+# Optional Extras: [voice] Mode
+# Cài đặt qua: pip install faster-whisper kokoro-onnx soundfile
+# faster-whisper>=1.0.0
+# kokoro-onnx>=0.1.0
+# soundfile>=0.12.0
