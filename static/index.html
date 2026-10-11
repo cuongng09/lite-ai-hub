@@ -584,35 +584,10 @@
             text-align: center;
         }
         .welcome-title { font-size: 28px; font-weight: 700; color: var(--cl-text); margin-bottom: 8px; }
-        .welcome-sub { font-size: 15px; color: var(--cl-text-muted); margin-bottom: 32px; max-width: 480px; }
-        .quick-grid { 
-            display: grid; 
-            grid-template-columns: repeat(2, 1fr); 
-            gap: 10px; 
-            max-width: 540px; 
-            width: 100%; 
-        }
-        .quick-card {
-            border: 1px solid var(--cl-border);
-            border-radius: 12px;
-            padding: 14px 16px;
-            text-align: left;
-            cursor: pointer;
-            background: var(--cl-bg);
-            transition: background 0.12s, border-color 0.12s;
-        }
-        .quick-card:hover { background: var(--cl-bg-hover); border-color: var(--cl-accent); }
-        .quick-card .qc-label {
-            font-size: 13px;
-            font-weight: 600;
-            color: var(--cl-text);
-            margin-bottom: 3px;
-            font-family: 'SFMono-Regular', Consolas, monospace;
-            color: var(--cl-accent);
-        }
-        .quick-card .qc-desc { font-size: 12px; color: var(--cl-text-muted); }
+        .welcome-sub { font-size: 15px; color: var(--cl-text-muted); margin-bottom: 16px; max-width: 480px; }
 
         /* Loading dots */
+
         @keyframes bounce { 0%,80%,100%{transform:translateY(0)} 40%{transform:translateY(-4px)} }
         .thinking-dot { display:inline-block; animation:bounce 1.4s infinite; background:var(--cl-accent); border-radius:50%; width:5px;height:5px; }
         .thinking-dot:nth-child(2){animation-delay:.15s}
@@ -689,8 +664,9 @@
         <div v-if="showDocsPanel" style="border-top:1px solid var(--cl-border);padding:8px 6px;">
             <div class="sidebar-section-title">📚 Tài liệu RAG</div>
             <label style="display:block;border:1.5px dashed var(--cl-border);border-radius:8px;padding:10px;text-align:center;cursor:pointer;margin:4px;font-size:12px;color:var(--cl-text-muted);">
-                <input type="file" @change="uploadDocument" class="hidden" accept=".pdf,.docx,.txt">
-                + Nạp PDF / DOCX / TXT
+                <input type="file" @change="uploadDocument" class="hidden" accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.csv,.txt,.md">
+                + Nạp tài liệu (PDF, Word, PPTX, Excel, TXT, CSV)
+
             </label>
             <div v-if="isUploading" style="font-size:12px;color:var(--cl-accent);padding:4px 8px;display:flex;align-items:center;gap:6px;">
                 <div style="width:10px;height:10px;border:2px solid var(--cl-accent);border-top-color:transparent;border-radius:50%;animation:spin 0.8s linear infinite;"></div>
@@ -816,25 +792,8 @@
             <div class="welcome-sub">
                 AI cục bộ chạy 100% trên máy bạn. Gõ <code style="font-size:13px;background:var(--cl-code-bg);border:1px solid var(--cl-border);padding:1px 6px;border-radius:5px;color:var(--cl-accent);">/</code> để chọn kỹ năng chuyên biệt.
             </div>
-            <div class="quick-grid">
-                <div class="quick-card" @click="insertSkillPrompt('code-review-vi')">
-                    <div class="qc-label">/code-review-vi</div>
-                    <div class="qc-desc">Rà soát mã nguồn chuyên sâu</div>
-                </div>
-                <div class="quick-card" @click="insertSkillPrompt('deep-research-report')">
-                    <div class="qc-label">/deep-research-report</div>
-                    <div class="qc-desc">Báo cáo nghiên cứu đa nguồn</div>
-                </div>
-                <div class="quick-card" @click="insertSkillPrompt('web-ui-designer')">
-                    <div class="qc-label">/web-ui-designer</div>
-                    <div class="qc-desc">Thiết kế giao diện HTML/CSS</div>
-                </div>
-                <div class="quick-card" @click="insertSkillPrompt('viet-writer')">
-                    <div class="qc-label">/viet-writer</div>
-                    <div class="qc-desc">Biên tập văn bản tiếng Việt</div>
-                </div>
-            </div>
         </div>
+
 
         <!-- ===== INPUT AREA ===== -->
         <div class="input-shell">
@@ -926,7 +885,8 @@
                 </div>
 
                 <!-- Hidden file input -->
-                <input type="file" ref="fileInputRef" @change="uploadDocument" class="hidden" accept=".pdf,.docx,.txt" style="display:none;">
+                <input type="file" ref="fileInputRef" @change="uploadDocument" class="hidden" accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.csv,.txt,.md" style="display:none;">
+
 
                 <!-- Bottom row: chips + send -->
                 <div class="input-bottom-row">

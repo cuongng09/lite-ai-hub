@@ -12,18 +12,25 @@ logger = logging.getLogger(__name__)
 
 
 class DocumentParser:
-    """Trích xuất nội dung từ PDF, DOCX, TXT thuần Python."""
+    """Trích xuất nội dung đa định dạng: PDF, Word (DOCX/DOC), PowerPoint (PPTX/PPT), Excel (XLSX/XLS/CSV), TXT/MD."""
 
     @staticmethod
     def extract_text(file_path: str) -> str:
         ext = os.path.splitext(file_path)[1].lower()
         if ext == ".pdf":
             return DocumentParser._parse_pdf(file_path)
-        elif ext in [".docx", ".doc"]:
+        elif ext == ".docx":
             return DocumentParser._parse_docx(file_path)
+        elif ext == ".doc":
+            return DocumentParser._parse_doc(file_path)
+        elif ext in [".pptx", ".ppt"]:
+            return DocumentParser._parse_pptx(file_path)
+        elif ext in [".xlsx", ".xls"]:
+            return DocumentParser._parse_xlsx(file_path)
+        elif ext in [".csv", ".tsv"]:
+            return DocumentParser._parse_csv(file_path)
         else:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                return f.read()
+            return DocumentParser._parse_plain_text(file_path)
 
     @staticmethod
     def _parse_pdf(file_path: str) -> str:
@@ -40,7 +47,108 @@ class DocumentParser:
     def _parse_docx(file_path: str) -> str:
         import docx
         doc = docx.Document(file_path)
-        return "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+        parts = []
+        for p in doc.paragraphs:
+            if p.text.strip():
+                parts.append(p.text.strip())
+        # Trích xuất dữ liệu bảng trong Word nếu có
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                if cells:
+                    parts.append(" | ".join(cells))
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _parse_doc(file_path: str) -> str:
+        try:
+            return DocumentParser._parse_docx(file_path)
+        except Exception:
+            pass
+        try:
+            with open(file_path, "rb") as f:
+                content = f.read()
+            text = content.decode("utf-8", errors="ignore")
+            lines = [line.strip() for line in re.findall(r'[\w\s,.\-!?:;]{4,}', text) if line.strip()]
+            return "\n".join(lines)
+        except Exception as e:
+            logger.warning(f"Lỗi đọc file .doc: {e}")
+            return ""
+
+    @staticmethod
+    def _parse_pptx(file_path: str) -> str:
+        try:
+            from pptx import Presentation
+            prs = Presentation(file_path)
+            slides_text = []
+            for idx, slide in enumerate(prs.slides, start=1):
+                slide_parts = [f"### Slide {idx}"]
+                for shape in slide.shapes:
+                    if shape.has_text_frame:
+                        for paragraph in shape.text_frame.paragraphs:
+                            t = paragraph.text.strip()
+                            if t:
+                                slide_parts.append(t)
+                if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                    notes = slide.notes_slide.notes_text_frame.text.strip()
+                    if notes:
+                        slide_parts.append(f"(Ghi chú thuyết trình: {notes})")
+                if len(slide_parts) > 1:
+                    slides_text.append("\n".join(slide_parts))
+            return "\n\n".join(slides_text)
+        except Exception as e:
+            logger.warning(f"Lỗi đọc file PPTX: {e}")
+            return ""
+
+    @staticmethod
+    def _parse_xlsx(file_path: str) -> str:
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(file_path, data_only=True, read_only=True)
+            sheets_text = []
+            for sheetname in wb.sheetnames:
+                ws = wb[sheetname]
+                rows_data = []
+                for row in ws.iter_rows(values_only=True):
+                    cells = [str(c).strip() if c is not None else "" for c in row]
+                    if any(cells):
+                        rows_data.append(" | ".join(cells))
+                    if len(rows_data) >= 500:
+                        rows_data.append("... [Đã rút gọn các dòng tiếp theo]")
+                        break
+                if rows_data:
+                    sheets_text.append(f"### Bảng tính: {sheetname}\n" + "\n".join(rows_data))
+            wb.close()
+            return "\n\n".join(sheets_text)
+        except Exception as e:
+            logger.warning(f"Lỗi đọc file Excel XLSX: {e}")
+            return ""
+
+    @staticmethod
+    def _parse_csv(file_path: str) -> str:
+        import csv
+        for enc in ["utf-8", "utf-8-sig", "latin-1", "cp1258"]:
+            try:
+                with open(file_path, "r", encoding=enc, errors="ignore") as f:
+                    reader = csv.reader(f)
+                    lines = [" | ".join(row) for row in list(reader)[:500] if any(row)]
+                    if lines:
+                        return "\n".join(lines)
+            except Exception:
+                continue
+        return ""
+
+    @staticmethod
+    def _parse_plain_text(file_path: str) -> str:
+        for enc in ["utf-8", "utf-8-sig", "latin-1", "cp1258", "utf-16"]:
+            try:
+                with open(file_path, "r", encoding=enc) as f:
+                    return f.read()
+            except Exception:
+                continue
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+
 
 
 class TextSplitter:
@@ -87,9 +195,11 @@ class TextSplitter:
             if chunk_content:
                 chunks.append(chunk_content)
 
-            # Bước nhảy tiếp theo có overlap liên tục
-            start = end - self.chunk_overlap
-            if start < 0 or start >= text_length:
+            next_start = end - self.chunk_overlap
+            if next_start <= start:
+                next_start = end
+            start = next_start
+            if start >= text_length:
                 break
 
         return chunks
@@ -327,9 +437,9 @@ class SQLiteVectorStore:
             fts_scores: Dict[int, float] = {}
             if query_text.strip():
                 clean_q = re.sub(r'[^\w\s]', ' ', query_text).strip()
-                tokens = clean_q.split()
+                tokens = [t for t in clean_q.split() if len(t) > 1][:8]
                 if tokens:
-                    fts_query = " OR ".join(f'"{t}"' for t in tokens[:6])
+                    fts_query = " OR ".join(f'"{t}"' for t in tokens)
                     try:
                         cursor.execute(
                             """
@@ -337,45 +447,52 @@ class SQLiteVectorStore:
                             FROM chunks_fts
                             WHERE chunks_fts MATCH ?
                             ORDER BY rank
-                            LIMIT 20;
+                            LIMIT 40;
                             """,
                             (fts_query,)
                         )
-                        for cid_raw, rank_val in cursor.fetchall():
+                        ranked = cursor.fetchall()
+                        # FTS5 bm25: giá trị càng âm càng khớp → chuẩn hóa theo thứ hạng
+                        for rank_i, (cid_raw, _rank_val) in enumerate(ranked):
                             cid = int(cid_raw)
-                            raw_rank = abs(float(rank_val))
-                            fts_scores[cid] = raw_rank / (1.0 + raw_rank)
+                            fts_scores[cid] = 1.0 / (60.0 + rank_i)
                     except Exception as e:
                         logger.debug(f"Lỗi truy vấn FTS5: {e}")
 
-
-        # 3. Tính toán điểm kết hợp và lọc ngưỡng
-        scored_results = []
+        meta = []
+        vectors = []
+        dim = int(q_vec.shape[0])
         for row in rows:
             chunk_id, d_id, filename, doc_emb_model, chunk_index, content, emb_bytes = row
-
             if doc_emb_model and doc_emb_model != target_model:
-                logger.warning(
-                    f"Cảnh báo: Tài liệu '{filename}' được nhúng bằng '{doc_emb_model}', nhưng truy vấn dùng '{target_model}'."
-                )
-
-            chunk_vec = np.frombuffer(emb_bytes, dtype=np.float32)
-            chunk_norm = np.linalg.norm(chunk_vec)
-            if chunk_norm == 0 or len(chunk_vec) != len(q_vec):
                 continue
+            chunk_vec = np.frombuffer(emb_bytes, dtype=np.float32)
+            if chunk_vec.size != dim:
+                continue
+            meta.append((chunk_id, d_id, filename, chunk_index, content))
+            vectors.append(chunk_vec)
 
-            # Cosine similarity
-            cos_sim = float(np.dot(q_vec, chunk_vec) / (q_norm * chunk_norm))
+        if not vectors:
+            return []
 
-            # Kết hợp điểm Cosine và FTS5 BM25
+        matrix = np.vstack(vectors)
+        norms = np.linalg.norm(matrix, axis=1)
+        valid = norms > 1e-12
+        if not np.any(valid):
+            return []
+
+        cos_all = np.zeros(len(vectors), dtype=np.float32)
+        cos_all[valid] = (matrix[valid] @ q_vec) / (norms[valid] * q_norm)
+
+        scored_results = []
+        for i, (chunk_id, d_id, filename, chunk_index, content) in enumerate(meta):
+            if not valid[i]:
+                continue
+            cos_sim = float(cos_all[i])
             fts_sim = fts_scores.get(chunk_id, 0.0)
-            if fts_scores:
-                final_score = (0.7 * cos_sim) + (0.3 * fts_sim)
-            else:
-                final_score = cos_sim
-
-
-            # Lọc theo ngưỡng tối thiểu
+            blended = (0.7 * cos_sim) + (0.3 * fts_sim) if fts_scores else cos_sim
+            # Giữ chunk ngữ nghĩa mạnh dù không khớp từ khóa (tránh hybrid làm loãng)
+            final_score = max(cos_sim, blended) if fts_scores else cos_sim
             if final_score >= min_score:
                 scored_results.append({
                     "chunk_id": chunk_id,
@@ -388,7 +505,6 @@ class SQLiteVectorStore:
                     "fts_score": round(fts_sim, 4)
                 })
 
-        # Sắp xếp giảm dần theo điểm cuối cùng
         scored_results.sort(key=lambda x: x["score"], reverse=True)
         return scored_results[:top_k]
 
@@ -580,7 +696,9 @@ class SQLiteVectorStore:
         is_active: bool = True,
         is_gem: bool = False,
         prompt_instruction: str = "",
-        attached_doc_ids: Optional[List[int]] = None
+        attached_doc_ids: Optional[List[int]] = None,
+        update_active: bool = True,
+        update_instruction: bool = True
     ) -> str:
         """Tạo hoặc cập nhật skill/gem trong SQLite."""
         skill_id = str(uuid.uuid4())
@@ -592,11 +710,24 @@ class SQLiteVectorStore:
             existing = cursor.fetchone()
             if existing:
                 s_id = existing[0]
-                cursor.execute("""
-                    UPDATE skills
-                    SET description = ?, is_active = ?, is_gem = ?, prompt_instruction = ?, attached_doc_ids = ?, updated_at = ?
-                    WHERE id = ?;
-                """, (description, 1 if is_active else 0, 1 if is_gem else 0, prompt_instruction, doc_json, now_iso, s_id))
+                if update_active and update_instruction:
+                    cursor.execute("""
+                        UPDATE skills
+                        SET description = ?, is_active = ?, is_gem = ?, prompt_instruction = ?, attached_doc_ids = ?, updated_at = ?
+                        WHERE id = ?;
+                    """, (description, 1 if is_active else 0, 1 if is_gem else 0, prompt_instruction, doc_json, now_iso, s_id))
+                elif update_instruction:
+                    cursor.execute("""
+                        UPDATE skills
+                        SET description = ?, is_gem = ?, prompt_instruction = ?, attached_doc_ids = ?, updated_at = ?
+                        WHERE id = ?;
+                    """, (description, 1 if is_gem else 0, prompt_instruction, doc_json, now_iso, s_id))
+                else:
+                    cursor.execute("""
+                        UPDATE skills
+                        SET description = ?, updated_at = ?
+                        WHERE id = ?;
+                    """, (description, now_iso, s_id))
                 conn.commit()
                 return s_id
             else:

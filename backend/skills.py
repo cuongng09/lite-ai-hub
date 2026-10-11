@@ -31,6 +31,11 @@ logger = logging.getLogger(__name__)
 class SkillRegistry:
     """Quản lý, nạp và định tuyến hệ thống Skill & Gemini Gems."""
 
+    AUTO_INJECT_MAX_CHARS = 3500
+    AUTO_MATCH_MAX_SKILL_CHARS = 12000
+    TOOL_SKILL_MAX_CHARS = 16000
+    SHORT_QUERY_CHARS = 12
+
     def __init__(
         self,
         skills_dir: Path,
@@ -42,6 +47,7 @@ class SkillRegistry:
         self.ollama_client = ollama_client
         self.skills_cache: Dict[str, Dict[str, Any]] = {}
         self.description_embeddings: Dict[str, List[float]] = {}
+        self._disk_mtime: float = 0.0
         self._init_skills_dir()
         self.reload_skills()
 
@@ -108,7 +114,9 @@ class SkillRegistry:
                                 name=name,
                                 description=parsed["description"],
                                 is_active=True,
-                                is_gem=False
+                                is_gem=False,
+                                update_active=False,
+                                update_instruction=False
                             )
                             self.skills_cache[name] = parsed
 
@@ -130,7 +138,23 @@ class SkillRegistry:
             elif name in self.skills_cache:
                 self.skills_cache[name]["is_active"] = s.get("is_active", True)
 
+        self._disk_mtime = self._latest_disk_mtime()
         logger.info(f"Đã nạp {len(self.skills_cache)} skills và gems vào hệ thống.")
+
+    def _latest_disk_mtime(self) -> float:
+        if not self.skills_dir.exists():
+            return 0.0
+        latest = 0.0
+        for skill_folder in self.skills_dir.iterdir():
+            skill_md = skill_folder / "SKILL.md"
+            if skill_md.is_file():
+                latest = max(latest, skill_md.stat().st_mtime)
+        return latest
+
+    def reload_if_stale(self):
+        """Chỉ quét lại đĩa khi SKILL.md thay đổi — tránh upsert SQLite mỗi lần GET."""
+        if self._latest_disk_mtime() != self._disk_mtime:
+            self.reload_skills()
 
     def get_active_skills(self) -> List[Dict[str, Any]]:
         """Lấy danh sách các skill và gems đang được bật."""
@@ -171,10 +195,30 @@ class SkillRegistry:
         if not skill:
             return f"Không tìm thấy skill '{clean_name}'. Vui lòng kiểm tra lại danh sách skills khả dụng."
 
+        return self.format_skill_context(
+            clean_name,
+            skill.get("content", ""),
+            max_chars=self.TOOL_SKILL_MAX_CHARS
+        )
+
+    def format_skill_context(
+        self,
+        name: str,
+        content: str,
+        max_chars: Optional[int] = None
+    ) -> str:
+        body = content or ""
+        note = ""
+        if max_chars and len(body) > max_chars:
+            body = body[:max_chars].rstrip()
+            note = (
+                "\n[Đã rút gọn. Gọi tool `use_skill` hoặc `read_skill_file` "
+                "nếu cần phần hướng dẫn / references đầy đủ.]\n"
+            )
         return (
-            f"=== NỘI DUNG HƯỚNG DẪN SKILL: {clean_name} ===\n"
-            f"{skill.get('content', '')}\n"
-            f"=================================================="
+            f"=== CHUYÊN MÔN KỸ NĂNG: {name} ===\n"
+            f"{body}{note}\n"
+            f"=========================================="
         )
 
     def read_skill_file(self, skill_name: str, relative_path: str) -> str:
@@ -219,22 +263,28 @@ class SkillRegistry:
     async def match_skill_by_semantics(
         self,
         query: str,
-        threshold: float = 0.55,
-        model: str = "bge-m3:latest"
+        threshold: float = 0.68,
+        model: str = "bge-m3:latest",
+        query_embedding: Optional[List[float]] = None
     ) -> Optional[str]:
         """
-        Đường 2: Tự khớp ngữ nghĩa (Semantic matching) qua embedding description
-        của các skill với câu hỏi của người dùng.
+        Đường 2: Tự khớp ngữ nghĩa qua embedding description.
+        Bỏ qua câu ngắn và skill quá lớn (tránh nạp last30days/docx vào context).
         """
         if not self.ollama_client or not query.strip():
             return None
+        if len(query.strip()) < self.SHORT_QUERY_CHARS:
+            return None
 
-        active_skills = self.get_active_skills()
+        active_skills = [
+            s for s in self.get_active_skills()
+            if len(s.get("content") or "") <= self.AUTO_MATCH_MAX_SKILL_CHARS
+        ]
         if not active_skills:
             return None
 
         try:
-            q_emb = await self.ollama_client.get_embedding(query, model=model)
+            q_emb = query_embedding or await self.ollama_client.get_embedding(query, model=model)
             if not q_emb:
                 return None
 
@@ -243,27 +293,33 @@ class SkillRegistry:
             if q_norm == 0:
                 return None
 
-            # Tính embedding cho các description nếu chưa có
+            missing = [
+                s for s in active_skills
+                if s["name"] not in self.description_embeddings
+            ]
+            if missing:
+                texts = [f"{s['name']}: {s.get('description', '')}" for s in missing]
+                embs = await self.ollama_client.get_embeddings_batch(texts, model=model)
+                for s, emb in zip(missing, embs):
+                    if emb:
+                        self.description_embeddings[s["name"]] = emb
+
             best_skill = None
             best_score = -1.0
+            dim = int(q_vec.shape[0])
 
             for s in active_skills:
-                name = s["name"]
-                desc = s.get("description", "")
-                if name not in self.description_embeddings:
-                    emb = await self.ollama_client.get_embedding(f"{name}: {desc}", model=model)
-                    if emb:
-                        self.description_embeddings[name] = emb
-
-                d_emb = self.description_embeddings.get(name)
-                if d_emb:
-                    d_vec = np.array(d_emb, dtype=np.float32)
-                    d_norm = np.linalg.norm(d_vec)
-                    if d_norm > 0 and len(d_vec) == len(q_vec):
-                        sim = float(np.dot(q_vec, d_vec) / (q_norm * d_norm))
-                        if sim > best_score:
-                            best_score = sim
-                            best_skill = name
+                d_emb = self.description_embeddings.get(s["name"])
+                if not d_emb or len(d_emb) != dim:
+                    continue
+                d_vec = np.array(d_emb, dtype=np.float32)
+                d_norm = np.linalg.norm(d_vec)
+                if d_norm <= 0:
+                    continue
+                sim = float(np.dot(q_vec, d_vec) / (q_norm * d_norm))
+                if sim > best_score:
+                    best_score = sim
+                    best_skill = s["name"]
 
             if best_score >= threshold and best_skill:
                 logger.info(f"Khớp ngữ nghĩa tự động với Skill '{best_skill}' (độ tương đồng: {best_score:.3f})")

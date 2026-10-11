@@ -24,16 +24,12 @@ class DeepResearchEngine:
                 f"Chỉ trả về JSON array gồm 3 chuỗi. Ví dụ: [\"truy vấn 1\", \"truy vấn 2\", \"truy vấn 3\"]."
             )
             try:
-                tokens = []
-                async for ev in self.ollama_client.stream_chat_events(
+                full_text = (await self.ollama_client.chat_complete(
                     messages=[{"role": "user", "content": prompt}],
                     model=model,
-                    num_ctx=2048
-                ):
-                    if ev.get("type") == "token":
-                        tokens.append(ev["token"])
-
-                full_text = "".join(tokens).strip()
+                    num_ctx=1024,
+                    temperature=0.2
+                )).strip()
                 match = re.search(r'\[[\s\S]*?\]', full_text)
                 if match:
                     queries = json.loads(match.group(0))

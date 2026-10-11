@@ -47,3 +47,11 @@ def test_skill_registry_and_tools(tmp_path):
     cmd, remaining = registry.extract_explicit_skill_command("/sample-skill Viết bài báo cáo")
     assert cmd == "sample-skill"
     assert remaining == "Viết bài báo cáo"
+
+    truncated = registry.format_skill_context("sample-skill", "x" * 5000, max_chars=100)
+    assert len(truncated) < 500
+    assert "rút gọn" in truncated
+
+    store.set_skill_active("sample-skill", False)
+    registry.reload_skills()
+    assert registry.skills_cache["sample-skill"].get("is_active") is False

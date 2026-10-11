@@ -12,6 +12,12 @@ def test_text_splitter_sliding_window():
     for c in chunks:
         assert len(c) > 0
 
+
+def test_text_splitter_always_advances():
+    splitter = TextSplitter(chunk_size=30, chunk_overlap=25)
+    chunks = splitter.split_text("abc " * 80)
+    assert 2 <= len(chunks) <= 200
+
 def test_sqlite_vector_store(tmp_path):
     db_file = tmp_path / "test_rag.db"
     store = SQLiteVectorStore(db_path=str(db_file))
@@ -38,6 +44,15 @@ def test_sqlite_vector_store(tmp_path):
     assert len(results) >= 1
     assert "Python" in results[0]["content"]
     assert results[0]["score"] > 0.2
+
+    skipped = store.search_similar(
+        query_embedding=[0.1] * 128,
+        query_text="Python",
+        top_k=2,
+        min_score=0.01,
+        target_model="other-model:latest"
+    )
+    assert skipped == []
 
     # 4. Session management với created_at hợp lệ
     sess = store.create_session(title="Phiên test", mode="offline")

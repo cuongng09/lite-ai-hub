@@ -180,6 +180,44 @@ class OllamaClient:
         except Exception as e:
             yield {"type": "error", "error": f"Không thể kết nối đến Ollama: {str(e)}"}
 
+    async def chat_complete(
+        self,
+        messages: List[Dict[str, Any]],
+        model: str = "qwen2.5:latest",
+        system: Optional[str] = None,
+        num_ctx: int = 2048,
+        temperature: float = 0.2
+    ) -> str:
+        """Gọi /api/chat không stream — nhanh hơn khi chỉ cần JSON ngắn (sub-query)."""
+        formatted = []
+        has_system = False
+        for m in messages:
+            if m.get("role") == "system":
+                has_system = True
+                formatted.append({"role": "system", "content": system or m.get("content", "")})
+            else:
+                formatted.append(dict(m))
+        if system and not has_system:
+            formatted.insert(0, {"role": "system", "content": system})
+
+        try:
+            res = await self._client.post(
+                "/api/chat",
+                json={
+                    "model": model,
+                    "messages": formatted,
+                    "stream": False,
+                    "keep_alive": "60m",
+                    "options": {"temperature": temperature, "num_ctx": num_ctx}
+                },
+                timeout=45.0
+            )
+            if res.status_code == 200:
+                return (res.json().get("message") or {}).get("content", "") or ""
+        except Exception as e:
+            logger.warning(f"chat_complete thất bại: {e}")
+        return ""
+
     async def stream_chat(
         self,
         messages: List[Dict[str, str]],

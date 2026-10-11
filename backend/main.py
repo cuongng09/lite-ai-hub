@@ -2,11 +2,12 @@ import os
 import re
 import json
 import asyncio
+import logging
 import shutil
 import tempfile
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -18,6 +19,8 @@ from backend.ollama_client import OllamaClient
 from backend.rag import DocumentParser, TextSplitter, SQLiteVectorStore
 from backend.tools import TOOL_DEFINITIONS, ToolExecutor
 from backend.skills import SkillRegistry
+
+logger = logging.getLogger(__name__)
 
 # Xác định đường dẫn gốc tuyệt đối của dự án
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -308,7 +311,7 @@ async def upload_document(
 @app.get("/api/skills")
 async def get_skills():
     """Lấy danh sách tất cả các Skills và Gems hiện có."""
-    skill_registry.reload_skills()
+    skill_registry.reload_if_stale()
     skills_list = []
     for s in skill_registry.skills_cache.values():
         if not s["name"].startswith("system-"):
@@ -367,16 +370,13 @@ async def generate_gem_prompt(req: GenerateGemPromptRequest):
         f"Bản hướng dẫn cần nêu rõ: Vai trò (Persona), Mục tiêu chính, Nguyên tắc ứng xử, Định dạng câu trả lời. "
         f"Trả về trực tiếp nội dung hướng dẫn bằng tiếng Việt, không kèm lời chào."
     )
-    tokens = []
-    async for ev in ollama_client.stream_chat_events(
+    instruction = await ollama_client.chat_complete(
         messages=[{"role": "user", "content": prompt}],
         model=req.model or "qwen2.5:latest",
-        num_ctx=2048
-    ):
-        if ev.get("type") == "token":
-            tokens.append(ev["token"])
-
-    return {"instruction": "".join(tokens).strip()}
+        num_ctx=2048,
+        temperature=0.4
+    )
+    return {"instruction": instruction.strip()}
 
 
 # --- ENDPOINT STREAM CHAT CHÍNH VỚI ĐỊNH TUYẾN SKILLS & DISCONNECT CANCEL ---
@@ -403,64 +403,70 @@ async def chat_stream(request: Request, chat_req: ChatRequest):
         context_blocks = []
         full_assistant_response = ""
         active_gem_doc_ids = None
+        matched_chunks = []
 
         # -------------------------------------------------------------
-        # 1. ĐỊNH TUYẾN SKILLS (3 ĐƯỜNG)
+        # 1. ĐỊNH TUYẾN SKILLS + DÙNG CHUNG 1 LƯỢT EMBEDDING
         # -------------------------------------------------------------
         actual_user_message = raw_last_message
         loaded_skill_context = ""
 
-        # Đường 1: Kiểm tra lệnh gõ tường minh /tên-skill
         explicit_skill, remaining_text = skill_registry.extract_explicit_skill_command(raw_last_message)
         if explicit_skill:
             actual_user_message = remaining_text or raw_last_message
             skill_data = skill_registry.skills_cache.get(explicit_skill)
             if skill_data:
-                yield f"data: {json.dumps({'type': 'status', 'message': f'🎯 Kích hoạt Skill: {explicit_skill}'}, ensure_ascii=False)}\n\n"
-                loaded_skill_context = f"=== CHUYÊN MÔN KỸ NĂNG: {explicit_skill} ===\n{skill_data.get('content', '')}\n=========================================="
+                yield f"data: {json.dumps({'type': 'status', 'message': f'Kích hoạt Skill: {explicit_skill}'}, ensure_ascii=False)}\n\n"
+                loaded_skill_context = skill_registry.format_skill_context(
+                    explicit_skill,
+                    skill_data.get("content", ""),
+                    max_chars=SkillRegistry.TOOL_SKILL_MAX_CHARS
+                )
                 if skill_data.get("attached_doc_ids"):
                     active_gem_doc_ids = skill_data["attached_doc_ids"]
 
-        # Đường 2: Tự khớp ngữ nghĩa (Semantic matching) nếu chưa có lệnh tường minh
-        elif not loaded_skill_context and actual_user_message:
+        need_query_embedding = bool(actual_user_message) and (
+            chat_req.use_rag
+            or (
+                not explicit_skill
+                and len(actual_user_message.strip()) >= SkillRegistry.SHORT_QUERY_CHARS
+                and any(
+                    len(s.get("content") or "") <= SkillRegistry.AUTO_MATCH_MAX_SKILL_CHARS
+                    for s in skill_registry.get_active_skills()
+                )
+            )
+        )
+        q_emb = None
+        if need_query_embedding:
+            q_emb = await ollama_client.get_embedding(
+                actual_user_message, model=chat_req.embedding_model
+            )
+
+        if not explicit_skill and actual_user_message:
             matched_skill = await skill_registry.match_skill_by_semantics(
                 actual_user_message,
-                threshold=0.55,
-                model=chat_req.embedding_model
+                threshold=0.68,
+                model=chat_req.embedding_model,
+                query_embedding=q_emb
             )
             if matched_skill:
                 skill_data = skill_registry.skills_cache.get(matched_skill)
                 if skill_data:
-                    yield f"data: {json.dumps({'type': 'status', 'message': f'💡 Tự động khớp Skill: {matched_skill}'}, ensure_ascii=False)}\n\n"
-                    loaded_skill_context = f"=== CHUYÊN MÔN KỸ NĂNG: {matched_skill} ===\n{skill_data.get('content', '')}\n=========================================="
+                    yield f"data: {json.dumps({'type': 'status', 'message': f'Tự động khớp Skill: {matched_skill}'}, ensure_ascii=False)}\n\n"
+                    loaded_skill_context = skill_registry.format_skill_context(
+                        matched_skill,
+                        skill_data.get("content", ""),
+                        max_chars=SkillRegistry.AUTO_INJECT_MAX_CHARS
+                    )
                     if skill_data.get("attached_doc_ids"):
                         active_gem_doc_ids = skill_data["attached_doc_ids"]
 
         is_online = (chat_req.chat_mode == "online") or chat_req.use_web_search or chat_req.use_deep_research
 
         # -------------------------------------------------------------
-        # 2. XỬ LÝ CHẾ ĐỘ THỜI SỰ (ONLINE MODE) VS KIẾN THỨC NỀN
+        # 2. ONLINE / OFFLINE + RAG SONG SONG (khi không deep-research)
         # -------------------------------------------------------------
-        if is_online and actual_user_message:
-            if chat_req.use_deep_research:
-                research_result = {"sources": [], "context_text": ""}
-                async for ev in deep_research_engine.stream_deep_research(actual_user_message, model=chat_req.model):
-                    if await request.is_disconnected():
-                        return
-                    if ev.get("type") == "status":
-                        yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
-                    elif ev.get("type") == "result":
-                        research_result = ev.get("data", {})
-                web_sources = research_result.get("sources", [])
-                context_blocks.append(research_result.get("context_text", ""))
-            else:
-                yield f"data: {json.dumps({'type': 'status', 'message': '🌐 Đang tìm kiếm thông tin thời sự mới nhất năm 2026...'}, ensure_ascii=False)}\n\n"
-                web_results = await asyncio.to_thread(search_engine.search, actual_user_message, 5)
-                if web_results:
-                    web_sources = web_results
-                    context_blocks.append(search_engine.format_search_context(web_results))
-
-            # Lấy system prompt từ skill hệ thống system-online
+        if is_online:
             system_instruction = skill_registry.get_system_skill_content("system-online") or (
                 "BẠN ĐANG Ở CHẾ ĐỘ THỜI SỰ (ONLINE MODE). THỜI GIAN HIỆN TẠI LÀ NĂM 2026. "
                 "CHỈ ĐƯỢC PHÉP TRẢ LỜI VÀ TỔNG HỢP DỰA TRÊN KẾT QUẢ TÌM KIẾM WEB BÊN DƯỚI. "
@@ -468,42 +474,62 @@ async def chat_stream(request: Request, chat_req: ChatRequest):
                 "LUÔN TRÍCH DẪN NGUỒN THEO SỐ [1], [2], [3]."
             )
         else:
-            # Lấy system prompt từ skill hệ thống system-offline
             system_instruction = skill_registry.get_system_skill_content("system-offline") or (
                 "BẠN ĐANG Ở CHẾ ĐỘ KIẾN THỨC NỀN (OFFLINE MODE). "
                 "Bạn là trợ lý AI thông minh chuyên về kiến thức nền tảng, tư duy logic, lập trình, toán học và sáng tạo. "
                 "Nếu viết mã nguồn, hãy dùng định dạng Markdown ```ngôn_ngữ ... ``` với cú pháp chuẩn."
             )
 
-        # Bổ sung Tầng 1: Tóm tắt các skills đang bật vào system prompt
         skills_summary = skill_registry.get_skills_system_prompt_summary()
         if skills_summary:
             system_instruction += f"\n\n{skills_summary}"
 
-        # -------------------------------------------------------------
-        # 3. XỬ LÝ RAG HYBRID SEARCH (FTS5 + COSINE)
-        # -------------------------------------------------------------
-        if chat_req.use_rag and actual_user_message:
-            q_emb = await ollama_client.get_embedding(actual_user_message, model=chat_req.embedding_model)
-            if q_emb:
-                matched_chunks = await asyncio.to_thread(
-                    vector_store.search_similar,
-                    query_embedding=q_emb,
-                    query_text=actual_user_message,
-                    top_k=4,
-                    min_score=0.35,
-                    target_model=chat_req.embedding_model,
-                    doc_ids=active_gem_doc_ids
+        async def _run_rag():
+            if not (chat_req.use_rag and actual_user_message and q_emb):
+                return []
+            return await asyncio.to_thread(
+                vector_store.search_similar,
+                query_embedding=q_emb,
+                query_text=actual_user_message,
+                top_k=4,
+                min_score=0.35,
+                target_model=chat_req.embedding_model,
+                doc_ids=active_gem_doc_ids
+            )
+
+        if is_online and actual_user_message and chat_req.use_deep_research:
+            research_result = {"sources": [], "context_text": ""}
+            async for ev in deep_research_engine.stream_deep_research(actual_user_message, model=chat_req.model):
+                if await request.is_disconnected():
+                    return
+                if ev.get("type") == "status":
+                    yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                elif ev.get("type") == "result":
+                    research_result = ev.get("data", {})
+            web_sources = research_result.get("sources", [])
+            context_blocks.append(research_result.get("context_text", ""))
+            matched_chunks = await _run_rag()
+        elif is_online and actual_user_message:
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Đang tìm kiếm thông tin thời sự mới nhất năm 2026...'}, ensure_ascii=False)}\n\n"
+            web_results, matched_chunks = await asyncio.gather(
+                asyncio.to_thread(search_engine.search, actual_user_message, 5),
+                _run_rag()
+            )
+            if web_results:
+                web_sources = web_results
+                context_blocks.append(search_engine.format_search_context(web_results))
+        else:
+            matched_chunks = await _run_rag()
+
+        if matched_chunks:
+            rag_sources = matched_chunks
+            rag_text_parts = ["--- DỮ LIỆU TÀI LIỆU NỘI BỘ (RAG HYBRID SEARCH) ---"]
+            for c in matched_chunks:
+                rag_text_parts.append(
+                    f"[Nguồn: {c['filename']} (Đoạn #{c['chunk_index']}) | Độ khớp: {c['score']:.2f}]\n{c['content']}\n"
                 )
-                if matched_chunks:
-                    rag_sources = matched_chunks
-                    rag_text_parts = ["--- DỮ LIỆU TÀI LIỆU NỘI BỘ (RAG HYBRID SEARCH) ---"]
-                    for c in matched_chunks:
-                        rag_text_parts.append(
-                            f"[Nguồn: {c['filename']} (Đoạn #{c['chunk_index']}) | Độ khớp: {c['score']:.2f}]\n{c['content']}\n"
-                        )
-                    rag_text_parts.append("-----------------------------------------------------")
-                    context_blocks.append("\n".join(rag_text_parts))
+            rag_text_parts.append("-----------------------------------------------------")
+            context_blocks.append("\n".join(rag_text_parts))
 
         # Gửi thông tin Sources trước cho Client
         if web_sources or rag_sources:
@@ -526,7 +552,15 @@ async def chat_stream(request: Request, chat_req: ChatRequest):
         # -------------------------------------------------------------
         # 4. STREAMING PHẢN HỒI KÈM TOOL CALLING & CANCEL CHECK
         # -------------------------------------------------------------
-        tools_to_pass = TOOL_DEFINITIONS if chat_req.use_tools else None
+        tools_to_pass = None
+        if chat_req.use_tools:
+            if is_online:
+                tools_to_pass = [
+                    t for t in TOOL_DEFINITIONS
+                    if t.get("function", {}).get("name") != "web_search"
+                ]
+            else:
+                tools_to_pass = TOOL_DEFINITIONS
 
         tool_calls_received = []
         async for event in ollama_client.stream_chat_events(
@@ -580,7 +614,9 @@ async def chat_stream(request: Request, chat_req: ChatRequest):
                         fn_args = {}
 
                 yield f"data: {json.dumps({'type': 'tool_executing', 'tool': fn_name, 'args': fn_args}, ensure_ascii=False)}\n\n"
-                tool_output_str, meta_data = tool_executor.execute_tool(fn_name, fn_args)
+                tool_output_str, meta_data = await asyncio.to_thread(
+                    tool_executor.execute_tool, fn_name, fn_args
+                )
 
                 if meta_data and meta_data.get("type") == "sources":
                     found_web = meta_data.get("web", [])
