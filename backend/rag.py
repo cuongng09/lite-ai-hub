@@ -1,13 +1,3 @@
-"""
-SQLite-vec & FTS5 Hybrid Search Vector Store cho RAG tài liệu (PDF, Docx, TXT).
-Tối ưu:
-- SQLite WAL mode (Write-Ahead Logging) cho concurrency cao và an toàn.
-- FTS5 Full-Text Search kết hợp Cosine Similarity (Hybrid Search BM25 + Vector).
-- Lưu trữ embedding_model để kiểm soát tính nhất quán số chiều vector.
-- TextSplitter cải tiến: Sliding Window Overlap xuyên suốt giữa các đoạn văn.
-- Ngưỡng điểm tối thiểu (min_score) loại bỏ chunk không liên quan.
-"""
-
 import os
 import re
 import json
@@ -377,12 +367,13 @@ class SQLiteVectorStore:
             # Cosine similarity
             cos_sim = float(np.dot(q_vec, chunk_vec) / (q_norm * chunk_norm))
 
-            # Kết hợp với điểm FTS5 nếu có
+            # Kết hợp điểm Cosine và FTS5 BM25
             fts_sim = fts_scores.get(chunk_id, 0.0)
-            if fts_sim > 0:
+            if fts_scores:
                 final_score = (0.7 * cos_sim) + (0.3 * fts_sim)
             else:
                 final_score = cos_sim
+
 
             # Lọc theo ngưỡng tối thiểu
             if final_score >= min_score:

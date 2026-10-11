@@ -1,15 +1,3 @@
-"""
-FastAPI Server chính cho Lite-AI Hub v3.0 (Kiến trúc Chuẩn mực & Hệ thống Skills).
-Hỗ trợ:
-- CORS chuẩn mực (giới hạn 127.0.0.1, localhost, tauri://localhost)
-- Đường dẫn tuyệt đối chuẩn (BASE_DIR Pathlib)
-- Kiểm tra ngắt kết nối client (request.is_disconnected)
-- Tách biệt hai chế độ: Offline vs Online lấy trực tiếp từ System Skills
-- Hệ thống Claude Skills + Gemini Gems (3 tầng nạp, 3 đường định tuyến)
-- RAG SQLite với FTS5 Hybrid Search (BM25 + Cosine) và batch embeddings
-- Deep Research Perplexity-style với deep page content extraction
-"""
-
 import os
 import re
 import json
@@ -20,7 +8,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -115,10 +103,6 @@ class ChatRequest(BaseModel):
 
 
 def prune_messages_budget(messages: List[ChatMessage], max_chars: int = 14000) -> List[Dict[str, Any]]:
-    """
-    Cắt tỉa lịch sử hội thoại từ tin nhắn mới nhất ngược về trước
-    để đảm bảo không vượt quá ngân sách context (num_ctx 8192).
-    """
     if not messages:
         return []
 
@@ -176,6 +160,11 @@ def extract_fallback_tool_calls(text: str) -> List[Dict[str, Any]]:
             except Exception:
                 continue
     return calls
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(status_code=204)
 
 
 @app.get("/api/health")
@@ -454,8 +443,14 @@ async def chat_stream(request: Request, chat_req: ChatRequest):
         # -------------------------------------------------------------
         if is_online and actual_user_message:
             if chat_req.use_deep_research:
-                yield f"data: {json.dumps({'type': 'status', 'message': '🔍 Đang tiến hành Deep Research đa nguồn năm 2026...'}, ensure_ascii=False)}\n\n"
-                research_result = await deep_research_engine.execute_deep_research(actual_user_message, model=chat_req.model)
+                research_result = {"sources": [], "context_text": ""}
+                async for ev in deep_research_engine.stream_deep_research(actual_user_message, model=chat_req.model):
+                    if await request.is_disconnected():
+                        return
+                    if ev.get("type") == "status":
+                        yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                    elif ev.get("type") == "result":
+                        research_result = ev.get("data", {})
                 web_sources = research_result.get("sources", [])
                 context_blocks.append(research_result.get("context_text", ""))
             else:

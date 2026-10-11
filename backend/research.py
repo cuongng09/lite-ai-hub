@@ -1,17 +1,8 @@
-"""
-Deep Web Research Engine (Perplexity style).
-Nâng cấp:
-1. Phân rã câu hỏi động bằng LLM (hoặc quy tắc ngữ nghĩa nếu offline).
-2. Tìm kiếm đồng thời đa nguồn.
-3. Tải nội dung trang web chính (deep page fetcher) và trích xuất nội dung thực tế thay vì chỉ lấy snippet ngắn.
-4. Vòng lặp phản hồi: "Đánh giá thông tin thiếu gì -> tìm kiếm bổ sung".
-"""
-
 import re
 import json
 import asyncio
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, AsyncGenerator
 import httpx
 from backend.search import WebSearchEngine
 from backend.ollama_client import OllamaClient
@@ -20,24 +11,17 @@ logger = logging.getLogger(__name__)
 
 
 class DeepResearchEngine:
-    """Công cụ nghiên cứu sâu đa nguồn Perplexity-style."""
-
     def __init__(self, search_engine: WebSearchEngine, ollama_client: Optional[OllamaClient] = None):
         self.search_engine = search_engine
         self.ollama_client = ollama_client
 
     async def generate_sub_queries(self, topic: str, model: str = "qwen2.5:latest") -> List[str]:
-        """
-        Phân rã câu hỏi thành 2-3 truy vấn con đa chiều bằng LLM.
-        Fallback sang quy tắc trích xuất từ khóa nếu LLM không phản hồi.
-        """
         topic_clean = topic.strip()
         if self.ollama_client:
             prompt = (
-                f"Hãy phân rã câu hỏi/chủ đề sau thành 3 câu truy vấn tìm kiếm Google ngắn gọn, độc lập, "
-                f"bao quát các khía cạnh khác nhau (tổng quan, chi tiết kỹ thuật/sự kiện, số liệu mới nhất 2026):\n"
+                f"Hãy phân rã câu hỏi/chủ đề sau thành 3 câu truy vấn tìm kiếm ngắn gọn, độc lập, bao quát các khía cạnh khác nhau:\n"
                 f"Chủ đề: \"{topic_clean}\"\n\n"
-                f"Chỉ trả về JSON array của 3 chuỗi, ví dụ: [\"truy vấn 1\", \"truy vấn 2\", \"truy vấn 3\"]. Không kèm lời giải thích."
+                f"Chỉ trả về JSON array gồm 3 chuỗi. Ví dụ: [\"truy vấn 1\", \"truy vấn 2\", \"truy vấn 3\"]."
             )
             try:
                 tokens = []
@@ -50,16 +34,14 @@ class DeepResearchEngine:
                         tokens.append(ev["token"])
 
                 full_text = "".join(tokens).strip()
-                # Tìm JSON array
                 match = re.search(r'\[[\s\S]*?\]', full_text)
                 if match:
                     queries = json.loads(match.group(0))
                     if isinstance(queries, list) and queries:
                         return [str(q).strip() for q in queries[:3] if str(q).strip()]
             except Exception as e:
-                logger.warning(f"Phân rã LLM sub-queries không thành công ({e}), dùng quy tắc fallback.")
+                logger.warning(f"Lỗi phân rã LLM sub-queries ({e}), dùng fallback.")
 
-        # Fallback theo quy tắc từ khóa
         return [
             f"{topic_clean} mới nhất năm 2026",
             f"{topic_clean} phân tích chi tiết dữ liệu",
@@ -67,10 +49,6 @@ class DeepResearchEngine:
         ]
 
     async def fetch_page_content(self, url: str, max_chars: int = 1500) -> str:
-        """
-        Tải nội dung HTML của trang web và trích xuất đoạn văn bản chính,
-        loại bỏ quảng cáo, scripts, css, menus.
-        """
         if not url or not url.startswith("http"):
             return ""
 
@@ -83,39 +61,29 @@ class DeepResearchEngine:
                 res = await client.get(url, headers=headers)
                 if res.status_code == 200:
                     html = res.text
-                    # Loại bỏ thẻ script, style, nav, header, footer, noscript
                     cleaned = re.sub(r'<(script|style|nav|header|footer|noscript|svg)[^>]*>[\s\S]*?</\1>', ' ', html, flags=re.IGNORECASE)
-                    
-                    # Trích xuất văn bản trong thẻ p hoặc article
                     paragraphs = re.findall(r'<p[^>]*>([\s\S]*?)</p>', cleaned, flags=re.IGNORECASE)
                     if paragraphs:
-                        text_parts = []
-                        for p in paragraphs:
-                            p_clean = re.sub(r'<[^>]+>', '', p).strip()
-                            if len(p_clean) > 30:  # Bỏ qua các đoạn quá ngắn
-                                text_parts.append(p_clean)
+                        text_parts = [
+                            re.sub(r'<[^>]+>', '', p).strip()
+                            for p in paragraphs
+                            if len(re.sub(r'<[^>]+>', '', p).strip()) > 30
+                        ]
                         full_extracted = " ".join(text_parts)
                     else:
                         full_extracted = re.sub(r'<[^>]+>', ' ', cleaned)
 
-                    # Chuẩn hóa khoảng trắng
                     full_extracted = re.sub(r'\s+', ' ', full_extracted).strip()
                     return full_extracted[:max_chars]
         except Exception as e:
             logger.debug(f"Không thể đọc trang web {url}: {e}")
         return ""
 
-    async def execute_deep_research(self, topic: str, model: str = "qwen2.5:latest") -> Dict[str, Any]:
-        """
-        Nghiên cứu sâu chủ đề với vòng lặp phản hồi:
-        1. Phân rã câu hỏi thành các sub-queries
-        2. Tìm kiếm song song
-        3. Tải nội dung trang web chính cho các bài viết hàng đầu
-        4. Vòng lặp: Nếu thiếu nguồn, tìm kiếm bổ sung 1 lượt
-        """
+    async def stream_deep_research(self, topic: str, model: str = "qwen2.5:latest") -> AsyncGenerator[Dict[str, Any], None]:
+        yield {"type": "status", "message": "🔍 Bước 1/4: Đang phân tích và phân rã các khía cạnh nghiên cứu..."}
         sub_queries = await self.generate_sub_queries(topic, model=model)
 
-        # Lượt 1: Tìm kiếm song song các sub-queries
+        yield {"type": "status", "message": f"🌐 Bước 2/4: Đang tìm kiếm song song {len(sub_queries)} hướng thông tin năm 2026..."}
         tasks = [
             asyncio.to_thread(self.search_engine.search, q, 3)
             for q in sub_queries
@@ -133,7 +101,6 @@ class DeepResearchEngine:
                         seen_links.add(href)
                         all_sources.append(dict(item))
 
-        # Lượt 2 (Vòng lặp đánh giá): Nếu chưa đủ 4 nguồn chất lượng, tìm kiếm bổ sung
         if len(all_sources) < 4:
             extra_query = f"{topic} tin tức tài liệu mới nhất"
             extra_res = await asyncio.to_thread(self.search_engine.search, extra_query, 4)
@@ -143,10 +110,9 @@ class DeepResearchEngine:
                     seen_links.add(href)
                     all_sources.append(dict(item))
 
-        # Chọn top 5 nguồn nổi bật nhất
         final_sources = all_sources[:5]
+        yield {"type": "status", "message": f"📄 Bước 3/4: Đã tìm thấy {len(all_sources)} nguồn. Đang trích xuất nội dung từ {len(final_sources)} trang uy tín..."}
 
-        # Đọc nội dung sâu từ các URL
         fetch_tasks = [
             self.fetch_page_content(s.get("href", ""))
             for s in final_sources
@@ -155,12 +121,12 @@ class DeepResearchEngine:
 
         for s, content in zip(final_sources, pages_content):
             if isinstance(content, str) and content.strip():
-                # Ghi đè body bằng nội dung trang chi tiết nếu có
                 s["deep_content"] = content.strip()
             else:
                 s["deep_content"] = s.get("body", "")
 
-        # Đánh số citation và dựng context có cấu trúc
+        yield {"type": "status", "message": f"📊 Bước 4/4: Đã trích xuất {len(final_sources)} tài liệu. Đang tổng hợp báo cáo chi tiết..."}
+
         context_lines = [f"=== BÁO CÁO NGHIÊN CỨU SÂU (DEEP RESEARCH 2026): {topic} ==="]
         for idx, s in enumerate(final_sources, start=1):
             s["citation_id"] = idx
@@ -174,8 +140,18 @@ class DeepResearchEngine:
             )
         context_lines.append("================================================================")
 
-        return {
-            "topic": topic,
-            "sources": final_sources,
-            "context_text": "\n".join(context_lines)
+        yield {
+            "type": "result",
+            "data": {
+                "topic": topic,
+                "sources": final_sources,
+                "context_text": "\n".join(context_lines)
+            }
         }
+
+    async def execute_deep_research(self, topic: str, model: str = "qwen2.5:latest") -> Dict[str, Any]:
+        result = None
+        async for ev in self.stream_deep_research(topic, model=model):
+            if ev.get("type") == "result":
+                result = ev.get("data")
+        return result or {"topic": topic, "sources": [], "context_text": ""}

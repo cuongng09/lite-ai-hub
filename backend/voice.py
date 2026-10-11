@@ -1,11 +1,3 @@
-"""
-Module Voice Mode Offline tùy chọn (STT & TTS).
-Lưu ý:
-- Phụ thuộc các gói tùy chọn: faster-whisper, kokoro-onnx, soundfile.
-- Cài đặt qua: pip install -r requirements.txt (hoặc nhóm extras [voice]).
-- Độ trễ thực tế phụ thuộc phần cứng CPU (khoảng 300ms - 800ms trên CPU tiêu chuẩn).
-"""
-
 import os
 import io
 import logging
