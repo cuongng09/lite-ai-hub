@@ -2,6 +2,7 @@ import os
 import re
 import json
 import asyncio
+from datetime import datetime
 import logging
 import shutil
 import tempfile
@@ -90,6 +91,12 @@ class CreateGemRequest(BaseModel):
 class GenerateGemPromptRequest(BaseModel):
     description: str
     model: Optional[str] = "qwen2.5:latest"
+
+
+class ExportDocxRequest(BaseModel):
+    title: Optional[str] = "Bộ câu hỏi ôn tập"
+    content: str
+    timestamp: Optional[str] = None
 
 
 class ChatRequest(BaseModel):
@@ -304,6 +311,124 @@ async def upload_document(
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+@app.post("/api/documents/parse-direct")
+async def parse_direct_documents(files: List[UploadFile] = File(...)):
+    """Trích xuất nội dung trực tiếp từ nhiều tài liệu để nạp nhanh vào prompt chat (không cần chờ vector hoá)."""
+    results = []
+    for f in files:
+        filename = f.filename or "unknown"
+        suffix = Path(filename).suffix
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+            shutil.copyfileobj(f.file, tmp_file)
+            tmp_path = tmp_file.name
+        try:
+            raw_text = DocumentParser.extract_text(tmp_path)
+            results.append({
+                "filename": filename,
+                "text": raw_text.strip(),
+                "char_count": len(raw_text.strip())
+            })
+        except Exception as e:
+            results.append({
+                "filename": filename,
+                "text": "",
+                "error": str(e)
+            })
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+    return {"documents": results}
+
+
+@app.post("/api/export-docx")
+async def export_docx(req: ExportDocxRequest):
+    """Xuất câu hỏi trắc nghiệm hoặc nội dung thành file Word (.docx) chuẩn đẹp với python-docx."""
+    import io
+    import docx
+    from docx.shared import Pt, Inches, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    doc = docx.Document()
+    for section in doc.sections:
+        section.top_margin = Inches(0.8)
+        section.bottom_margin = Inches(0.8)
+        section.left_margin = Inches(0.8)
+        section.right_margin = Inches(0.8)
+
+    # Tiêu đề
+    title_p = doc.add_paragraph()
+    title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run_title = title_p.add_run(req.title or "BỘ CÂU HỎI TRẮC NGHIỆM ÔN TẬP")
+    run_title.font.name = "Arial"
+    run_title.font.size = Pt(16)
+    run_title.font.bold = True
+    run_title.font.color.rgb = RGBColor(38, 38, 36)
+
+    # Date / Time
+    ts = req.timestamp or datetime.now().strftime("%H:%M:%S · %d/%m/%Y")
+    time_p = doc.add_paragraph()
+    time_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run_time = time_p.add_run(f"Thời gian tạo: {ts}")
+    run_time.font.name = "Arial"
+    run_time.font.size = Pt(10)
+    run_time.font.italic = True
+    run_time.font.color.rgb = RGBColor(120, 120, 120)
+
+    doc.add_paragraph()
+
+    lines = req.content.split("\n")
+    for line in lines:
+        line_s = line.strip()
+        if not line_s:
+            continue
+
+        p = doc.add_paragraph()
+        p.paragraph_format.space_after = Pt(3)
+
+        if line_s.startswith("#"):
+            heading_text = line_s.lstrip("#").strip()
+            r = p.add_run(heading_text)
+            r.font.name = "Arial"
+            r.font.size = Pt(13)
+            r.font.bold = True
+            r.font.color.rgb = RGBColor(217, 119, 87)
+        elif re.match(r'^(Câu\s*\d+|[\*\#]*\s*\d+[\.\:])', line_s, re.IGNORECASE):
+            r = p.add_run(line_s)
+            r.font.name = "Arial"
+            r.font.size = Pt(11)
+            r.font.bold = True
+            r.font.color.rgb = RGBColor(20, 20, 20)
+        elif re.match(r'^[A-D][\.\:\)]\s', line_s):
+            p.paragraph_format.left_indent = Inches(0.2)
+            r = p.add_run(line_s)
+            r.font.name = "Arial"
+            r.font.size = Pt(10.5)
+            r.font.color.rgb = RGBColor(60, 60, 60)
+        elif any(k in line_s.lower() for k in ["đáp án", "giải thích", "hướng dẫn"]):
+            r = p.add_run(line_s)
+            r.font.name = "Arial"
+            r.font.size = Pt(10.5)
+            r.font.italic = True
+            r.font.color.rgb = RGBColor(40, 120, 60)
+        else:
+            r = p.add_run(line_s)
+            r.font.name = "Arial"
+            r.font.size = Pt(10.5)
+
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+
+    filename = f"quiz_trac_nghiem_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        }
+    )
 
 
 # --- ENDPOINTS HỆ THỐNG SKILLS & GEMINI GEMS ---
